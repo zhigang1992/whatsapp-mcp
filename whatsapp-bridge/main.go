@@ -590,8 +590,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// The stored filename comes from time.Now() at processing time, so messages
+	// processed in the same second (e.g. during history sync) share a name.
+	// Key the path on the message ID so the cache check below can't return
+	// another message's file.
+	localPath = fmt.Sprintf("%s/%s_%s", chatDir, messageID, filename)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -640,10 +643,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// The stored URL is signed and expires (history-sync URLs often already
+	// have). whatsmeow can re-sign a fresh URL from the direct path, so try
+	// that first and fall back to Download(), which prefers the stored URL.
+	ctx := context.Background()
+	var mediaData []byte
+	if strings.HasPrefix(directPath, "/") {
+		mediaData, err = client.DownloadMediaWithPath(ctx, directPath, fileEncSHA256, fileSHA256, mediaKey, waMediaType, "", false)
+	} else {
+		err = fmt.Errorf("no usable direct path")
+	}
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		var fallbackErr error
+		mediaData, fallbackErr = client.Download(ctx, downloader)
+		if fallbackErr != nil {
+			return false, "", "", "", fmt.Errorf("failed to download media: via direct path: %v; via url: %v", err, fallbackErr)
+		}
 	}
 
 	// Save the downloaded media to file
@@ -666,13 +681,10 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query string: it carries the CDN auth params (oh/oe/_nc_sid/mms3),
+	// and whatsmeow appends "&hash=..." directly to the direct path, so it
+	// expects the "?" to already be there. Stripping it gets a 403.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
